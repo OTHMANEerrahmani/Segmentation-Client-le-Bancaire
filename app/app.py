@@ -4,6 +4,7 @@ from app.pages.index_page import index_page
 from app.pages.clustering_page import clustering_page
 from app.pages.profiles_page import profiles_page
 from app.pages.insights_page import insights_page
+from app.pages.cleaning_page import cleaning_page
 from app.analysis_state import AnalysisState
 
 
@@ -40,3 +41,6 @@ app.add_page(
 )
 app.add_page(profiles, route="/profiles", on_load=AnalysisState.load_and_analyze_data)
 app.add_page(insights, route="/insights", on_load=AnalysisState.load_and_analyze_data)
+def cleaning() -> rx.Component:
+    return base_layout(cleaning_page())
+app.add_page(cleaning, route="/cleaning")

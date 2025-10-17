@@ -94,6 +94,36 @@ def clustering_page() -> rx.Component:
             "Hierarchical clustering and segment profiling.",
             class_name="text-gray-600 mb-8",
         ),
+        rx.el.div(
+            rx.el.div(
+                rx.el.label("Algorithm", class_name="text-sm text-gray-600"),
+                rx.select(
+                    items=["hierarchical", "kmeans"],
+                    value=AnalysisState.clustering_algorithm,
+                    on_change=AnalysisState.set_clustering_algorithm,
+                    class_name="border rounded-lg px-3 py-2",
+                ),
+                class_name="flex flex-col gap-1",
+            ),
+            rx.el.div(
+                rx.el.label("# Clusters", class_name="text-sm text-gray-600"),
+                rx.input(
+                    value=AnalysisState.n_clusters,
+                    on_change=lambda v: AnalysisState.set_n_clusters(v),
+                    type="number",
+                    min=2,
+                    max=10,
+                    class_name="border rounded-lg px-3 py-2 w-32",
+                ),
+                class_name="flex flex-col gap-1",
+            ),
+            rx.button(
+                "Recompute",
+                on_click=AnalysisState.load_and_analyze_data,
+                class_name="px-4 py-2 rounded-lg bg-sky-600 text-white hover:bg-sky-700",
+            ),
+            class_name="flex items-end gap-4 mb-6",
+        ),
         rx.cond(
             AnalysisState.is_loading,
             rx.el.div(

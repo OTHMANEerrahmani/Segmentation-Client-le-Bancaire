@@ -29,6 +29,7 @@ def sidebar() -> rx.Component:
                 class_name="flex items-center gap-2",
             ),
             rx.el.nav(
+                sidebar_item("Data Cleaning", "sparkles", "/cleaning"),
                 sidebar_item("PCA Analysis", "bar-chart-2", "/"),
                 sidebar_item("Clustering", "users", "/clustering"),
                 sidebar_item("Customer Profiles", "user-cog", "/profiles"),

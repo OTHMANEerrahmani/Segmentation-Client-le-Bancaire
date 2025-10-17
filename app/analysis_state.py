@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 from typing import Any
 import os
 from sklearn.cluster import AgglomerativeClustering
+from sklearn.cluster import KMeans
 from scipy.cluster.hierarchy import dendrogram, linkage
 import plotly.figure_factory as ff
 
@@ -90,6 +91,22 @@ class AnalysisState(rx.State):
         3: "Budget-Conscious",
     }
     cluster_colors: list[str] = ["#38bdf8", "#fbbf24", "#34d399", "#f87171"]
+
+    # Connected pipeline artifacts
+    cleaned_data: pd.DataFrame = pd.DataFrame()
+    pca_data: list[list[float]] = []  # serialized PCA coordinates
+    clustered_data: list[dict] = []   # rows with cluster labels
+    n_clusters: int = 4
+    clustering_algorithm: str = "hierarchical"  # or "kmeans"
+
+    @rx.event
+    def set_n_clusters(self, value: int):
+        self.n_clusters = int(value)
+
+    @rx.event
+    def set_clustering_algorithm(self, value: str):
+        if value in ("hierarchical", "kmeans"):
+            self.clustering_algorithm = value
 
     @rx.var
     def filtered_customers(self) -> list[dict[str, str | int | float]]:
@@ -321,17 +338,26 @@ class AnalysisState(rx.State):
         """Loads data, performs cleaning, standardization, PCA, and correlation analysis."""
         async with self:
             self.is_loading = True
-        file_path = "assets/bank_customers.csv"
-        if not os.path.exists(file_path):
-            df = self._create_sample_data(file_path)
+        # Prefer cleaned data saved on disk if available.
+        clean_file = "assets/bank_customers_clean.csv"
+        if os.path.exists(clean_file):
+            df = pd.read_csv(clean_file)
         else:
-            df = pd.read_csv(file_path)
+            file_path = "assets/bank_customers.csv"
+            if not os.path.exists(file_path):
+                df = self._create_sample_data(file_path)
+            else:
+                df = pd.read_csv(file_path)
         for col in self.quant_vars:
             if df[col].isnull().any():
                 df[col] = df[col].fillna(df[col].median())
         async with self:
             self.df = df
             self.total_customers = len(df)
+        # Persist cleaned dataset in pipeline state
+        async with self:
+            self.cleaned_data = self.df.copy()
+
         X = self.df[self.quant_vars].copy()
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
@@ -406,6 +432,10 @@ class AnalysisState(rx.State):
             paper_bgcolor="white",
             plot_bgcolor="white",
         )
+        # Persist PCA coordinates
+        async with self:
+            self.pca_data = X_pca[:, :2].tolist()
+
         linkage_matrix = linkage(X_pca[:, :n_components_80_val], method="ward")
         dendro_fig = ff.create_dendrogram(linkage_matrix, color_threshold=15)
         dendro_fig.update_layout(
@@ -414,10 +444,15 @@ class AnalysisState(rx.State):
             plot_bgcolor="white",
             font=dict(family="Poppins"),
         )
-        n_clusters = 4
-        clustering = AgglomerativeClustering(n_clusters=n_clusters, linkage="ward")
+        n_clusters = int(self.n_clusters)
+        if self.clustering_algorithm == "kmeans":
+            clustering_model = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
+            labels = clustering_model.fit_predict(X_pca[:, :n_components_80_val])
+        else:
+            clustering_model = AgglomerativeClustering(n_clusters=n_clusters, linkage="ward")
+            labels = clustering_model.fit_predict(X_pca[:, :n_components_80_val])
         async with self:
-            self.df["cluster"] = clustering.fit_predict(X_pca[:, :n_components_80_val])
+            self.df["cluster"] = labels
         cluster_counts = self.df["cluster"].value_counts().sort_index()
         dist_data = [
             {
@@ -479,6 +514,8 @@ class AnalysisState(rx.State):
             self.cluster_distribution_data = dist_data
             self.segment_profiles = profiles
             self.segment_radar_charts = radars
+            # Persist clustered data for downstream pages
+            self.clustered_data = self.df.to_dict("records")
             self.is_loading = False
 
     @rx.var
@@ -524,3 +561,198 @@ class AnalysisState(rx.State):
             self.segment_profiles, key=lambda p: p["features"]["annual_income"]
         )
         return highest["name"]
+
+
+class DataCleaningState(rx.State):
+    """Manages data upload, cleaning pipeline, and reporting."""
+
+    is_processing: bool = False
+    raw_csv_bytes: bytes | None = None
+    raw_df: pd.DataFrame = pd.DataFrame()
+    clean_df: pd.DataFrame = pd.DataFrame()
+    report_df: pd.DataFrame = pd.DataFrame()
+
+    total_rows: int = 0
+    missing_values_count: int = 0
+    outliers_count: int = 0
+    corrections_count: int = 0
+
+    step: str = "upload"  # upload -> control -> diagnose -> treat -> report
+
+    @rx.event
+    def reset_cleaning(self):
+        self.is_processing = False
+        self.raw_csv_bytes = None
+        self.raw_df = pd.DataFrame()
+        self.clean_df = pd.DataFrame()
+        self.report_df = pd.DataFrame()
+        self.total_rows = 0
+        self.missing_values_count = 0
+        self.outliers_count = 0
+        self.corrections_count = 0
+        self.step = "upload"
+
+    @rx.event
+    async def upload_csv(self, file: list[rx.UploadFile]):
+        """Receive uploaded CSV list and store bytes backup (keep first)."""
+        if not file:
+            return
+        uploaded = file[0]
+        content = await uploaded.read()
+        self.raw_csv_bytes = content
+        from io import BytesIO
+
+        try:
+            self.raw_df = pd.read_csv(BytesIO(content))
+        except Exception:
+            # Try Excel just in case
+            try:
+                self.raw_df = pd.read_excel(BytesIO(content))
+            except Exception:
+                self.raw_df = pd.DataFrame()
+        self.total_rows = int(len(self.raw_df))
+        self.step = "control"
+
+    def _standardize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df.columns = (
+            df.columns.str.strip().str.lower().str.replace(" ", "_", regex=False)
+        )
+        return df
+
+    def _detect_outliers_zscore(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        if len(numeric_cols) == 0:
+            df["__is_outlier__"] = False
+            return df
+        from scipy import stats
+
+        z = np.abs(stats.zscore(df[numeric_cols], nan_policy="omit"))
+        if isinstance(z, np.ndarray):
+            mask = (z > 3).any(axis=1)
+        else:
+            mask = np.zeros(len(df), dtype=bool)
+        df["__is_outlier__"] = mask
+        return df
+
+    def _diagnose_errors(self, df_before: pd.DataFrame, df_after: pd.DataFrame) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        # Missing values imputed
+        for col in df_before.columns:
+            if df_before[col].isnull().sum() > 0:
+                records.append({
+                    "type": "missing",
+                    "column": col,
+                    "action": "impute",
+                    "strategy": "median_numeric_else_mode",
+                })
+        # Duplicates removed
+        if len(df_before) > len(df_after):
+            diff = int(len(df_before) - len(df_after))
+            if diff > 0:
+                records.append({
+                    "type": "duplicate",
+                    "column": "*",
+                    "action": "drop_duplicates",
+                    "count": diff,
+                })
+        return records
+
+    @rx.event(background=True)
+    async def run_cleaning(self):
+        if self.raw_df.empty:
+            return
+        async with self:
+            self.is_processing = True
+            self.step = "diagnose"
+
+        # Step 1-2: Control + Diagnose
+        df = self._standardize_columns(self.raw_df)
+        missing_before = int(df.isnull().sum().sum())
+        df = self._detect_outliers_zscore(df)
+        outliers_initial = int(df["__is_outlier__"].sum()) if "__is_outlier__" in df.columns else 0
+
+        # Step 3: Treat
+        df_treat = df.drop(columns=["__is_outlier__"]) if "__is_outlier__" in df.columns else df
+        for col in df_treat.columns:
+            if df_treat[col].dtype.kind in "biufc":
+                if df_treat[col].isnull().any():
+                    df_treat[col] = df_treat[col].fillna(df_treat[col].median())
+            else:
+                if df_treat[col].isnull().any():
+                    df_treat[col] = df_treat[col].fillna(df_treat[col].mode().iloc[0])
+        df_treat = df_treat.drop_duplicates()
+
+        # Recompute outliers after imputation
+        df_flag = self._detect_outliers_zscore(df_treat)
+        outliers_after = int(df_flag["__is_outlier__"].sum()) if "__is_outlier__" in df_flag.columns else 0
+        df_clean = df_treat.copy()
+
+        # Step 4: Document
+        records = self._diagnose_errors(self.raw_df, df_clean)
+        # add outlier info
+        if outliers_initial > 0:
+            records.append({
+                "type": "outlier",
+                "column": "*",
+                "action": "flagged",
+                "z_threshold": 3,
+                "count": outliers_initial,
+                "remaining": outliers_after,
+            })
+        report_df = pd.DataFrame(records)
+
+        async with self:
+            self.clean_df = df_clean
+            self.report_df = report_df
+            self.missing_values_count = int(missing_before)
+            self.outliers_count = int(outliers_initial)
+            self.corrections_count = int(report_df.shape[0])
+            self.step = "report"
+            self.is_processing = False
+        # Save cleaned CSV so other pages can load without cross-state checks
+        try:
+            os.makedirs("assets", exist_ok=True)
+            df_clean.to_csv("assets/bank_customers_clean.csv", index=False)
+        except Exception:
+            pass
+
+    @rx.event
+    def download_clean_csv(self):
+        if self.clean_df.empty:
+            return
+        return rx.download(
+            data=self.clean_df.to_csv(index=False).encode("utf-8"),
+            filename="bank_customers_clean.csv",
+        )
+
+    @rx.event
+    def download_report_csv(self):
+        if self.report_df.empty:
+            return
+        return rx.download(
+            data=self.report_df.to_csv(index=False).encode("utf-8"),
+            filename="data_cleaning_report.csv",
+        )
+
+    @rx.var
+    def has_upload(self) -> bool:
+        return self.raw_df is not None and not self.raw_df.empty
+
+    @rx.var
+    def has_clean(self) -> bool:
+        return self.clean_df is not None and not self.clean_df.empty
+
+    @rx.var
+    def has_report(self) -> bool:
+        return self.report_df is not None and not self.report_df.empty
+
+    @rx.var
+    def summary_stats(self) -> list[dict[str, str]]:
+        return [
+            {"name": "Total Rows", "value": str(self.total_rows)},
+            {"name": "Missing Values", "value": str(self.missing_values_count)},
+            {"name": "Outliers Detected", "value": str(self.outliers_count)},
+            {"name": "Corrections Logged", "value": str(self.corrections_count)},
+        ]
