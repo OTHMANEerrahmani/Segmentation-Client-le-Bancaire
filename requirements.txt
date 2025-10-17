@@ -1,0 +1,11 @@
+
+reflex==0.8.15a1
+pandas
+numpy
+scikit-learn
+scipy
+seaborn
+matplotlib
+plotly
+openpyxl
+kaleido
